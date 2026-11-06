@@ -111,26 +111,30 @@ function main() {
     try { return sh("git", args, { cwd: dir }); } catch (e) { return ""; }
   };
   run(["init", "-q"]);
+  run(["checkout", "-B", "main"]);
   run(["add", "-A"]);
   run(["-c", "user.name=workbuddy", "-c", "user.email=workbuddy@local",
     "commit", "-q", "-m", "feat: 微信读书 → Notion 云端同步"]);
   run(["remote", "remove", "origin"]);
   run(["remote", "add", "origin", "https://github.com/" + REPO + ".git"]);
   let ok = false;
-  for (let i = 1; i <= 4 && !ok; i++) {
+  let lastErr = "";
+  for (let i = 1; i <= 5 && !ok; i++) {
     try {
-      run(["push", "-q", "-u", "origin", "main"]);
+      sh("git", ["push", "-u", "origin", "main"], { cwd: dir });
       ok = true;
       console.log("    ✔ 已推送");
     } catch (e) {
-      console.log("    · 重试 " + i);
-      sh("git", ["branch", "-M", "main"], { cwd: dir });
+      lastErr = String(e.stderr || e.message || e).slice(0, 200);
+      console.log("    · 重试 " + i + (i < 5 ? "（" + lastErr.split("\n").pop().slice(0, 60) + "）" : ""));
+      // ★ 首次推送可能因为没有 main ref → 先建一个空的孤儿分支再推 ★
+      if (i === 1) run(["push", "-q", "origin", "HEAD:refs/heads/main"], { cwd: dir });
       execFileSync(process.platform === "win32" ? "timeout" : "sleep",
-        process.platform === "win32" ? ["/t", "3"] : ["3"]);
+        process.platform === "win32" ? ["/t", "4"] : ["4"]);
     }
   }
   if (!ok) {
-    console.log("    ✘ 推送失败");
+    console.log("    ✘ 推送失败：" + lastErr);
     return;
   }
 
