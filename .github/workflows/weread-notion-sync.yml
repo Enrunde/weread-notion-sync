@@ -1,0 +1,52 @@
+name: 微信读书 → Notion
+
+# ★★★★ 定时同步微信读书的书籍/划线/笔记到 Notion「微信读书知识库」★★★★ ★
+#  ★ 云端跑 → 电脑关机也能同步 ★
+#  ★ cron 用 UTC：北京时间 = UTC + 8 ★
+#    北京时间 09:00 → UTC 01:00
+#    北京时间 21:00 → UTC 13:00
+
+on:
+  schedule:
+    - cron: "0 1 * * *"    # 北京时间 09:00
+    - cron: "0 13 * * *"   # 北京时间 21:00
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v5
+
+      - name: 设定 Node
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - name: 同步 微信读书 → Notion
+        env:
+          WEREAD_VID: ${{ secrets.WEREAD_VID }}
+          WEREAD_SKEY: ${{ secrets.WEREAD_SKEY }}
+          WEREAD_REFRESH_TOKEN: ${{ secrets.WEREAD_REFRESH_TOKEN }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: node weread-sync.js
+
+      - name: 失败时开 issue
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = '微信读书 → Notion 同步失败'
+            const body = `自动同步失败，请检查：
+            - secret WEREAD_SKEY 是否有效（过期会自动续期，续期失败要重新扫码）
+            - secret NOTION_TOKEN 对应的 integration 是否已分享「微信读书知识库」
+            - 手动运行：node weread-sync.js --干跑
+            时间：${new Date().toISOString()}`
+            const { owner, repo } = context.repo
+            await github.rest.issues.create({ owner, repo, title, body })
