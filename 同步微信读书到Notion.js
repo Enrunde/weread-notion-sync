@@ -39,12 +39,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function main() {
   console.log("═══ 微信读书 → Notion「微信读书知识库」同步 ═══\n");
 
+  // ★ 凭证（★ Cookie 通道用；官方 API 用 API Key，两者独立 ★）
   const cred = W.readCred();
-  if (!cred.vid || !cred.skey) {
-    console.log("  ✘ 没有微信读书凭证");
-    console.log("    → 双击「双击登录微信读书.bat」扫码登录");
-    return;
-  }
 
   const token = N.loadToken();
   const books = new N.Store(N.DS_BOOK, "书籍ID", "标题");
@@ -81,9 +77,84 @@ async function main() {
   // ── ① 读微信读书 ──
   console.log("");
   console.log("  ── 读取微信读书 ──");
-  const shelf = await W.getShelf(cred);
-  const shelfIds = shelf.ids || Object.keys(shelf.books);
-  console.log("    书架在架 " + shelfIds.length + " 本（全量索引 " + (shelf.allIds || []).length + " 本）");
+
+  // ★★★ 双通道取数（★ 2026-11-07：官方 API 优先，Cookie 兜底 ★）★★★
+  //   ★ 官方 Agent API：API Key 认证 → 不依赖 Cookie → 云端也能跑 ★
+  //   ★ Cookie 方案：只能读「浏览器登录的那个账号」→ 且续期端点已 404 ★
+  //   ★ → 两个渠道的书架【合并】，划线各取各的（谁有就用谁的）★
+  const API = require("./微信读书官方API");
+  const hasKey = API.hasApiKey();
+  const shelfMap = {};          // bookId → 书籍概要
+  const allIds = [];
+  let apiShelfCount = 0;
+  let cookieShelfCount = 0;
+  let useApi = false;
+
+  // ① 官方 API
+  if (hasKey) {
+    try {
+      const sh = await API.getShelf();
+      apiShelfCount = sh.books.length;
+      for (const b of sh.books) {
+        const id = String(b.bookId || "");
+        if (!id) continue;
+        shelfMap[id] = {
+          bookId: id,
+          title: b.title || "",
+          author: b.author || "",
+          intro: b.intro || "",
+          isbn: b.isbn || "",
+          category: (b.categories && b.categories[0] && b.categories[0].title) || "",
+          bookUrl: b.readerLink || b.deepLink || ("https://weread.qq.com/web/reader/" + id),
+          cover: b.cover || "",
+          readState: b.readState || 0,
+          publishTime: b.publishTime || "",
+          wordCount: b.wordCount || 0,
+        };
+        allIds.push(id);
+      }
+      useApi = true;
+      console.log("    ✔ 官方 API：书架 " + apiShelfCount + " 本");
+    } catch (e) {
+      console.log("    ⚠ 官方 API 不可用：" + String(e.message).slice(0, 100));
+    }
+  } else {
+    console.log("    ⓘ 没有 API Key → 只用 Cookie 通道");
+  }
+
+  // ② Cookie 通道（★ 兜底 / 补漏 ★）
+  if (cred.vid && cred.skey) {
+    try {
+      const shelf = await W.getShelf(cred);
+      const ids = shelf.ids || Object.keys(shelf.books || {});
+      cookieShelfCount = ids.length;
+      for (const id of ids) {
+        if (!shelfMap[id]) {
+          const b = (shelf.books || {})[id] || {};
+          shelfMap[id] = Object.assign({ bookId: id }, b);
+          allIds.push(id);
+        }
+      }
+      console.log("    ✔ Cookie 通道：书架 " + cookieShelfCount + " 本" +
+        (useApi ? "（已合并去重）" : ""));
+    } catch (e) {
+      console.log("    ⚠ Cookie 通道不可用：" + String(e.message).slice(0, 90));
+      if (!useApi) {
+        console.log("    ✘ 两个通道都不可用 → 没有可同步的数据");
+        console.log("      → 双击「双击登录微信读书.bat」扫码，或补上 API Key");
+        return;
+      }
+    }
+  } else if (!useApi) {
+    console.log("  ✘ 没有微信读书凭证，也没有 API Key");
+    console.log("    → 双击「双击登录微信读书.bat」扫码，或补上 API Key");
+    return;
+  }
+
+  const shelf = { books: shelfMap, ids: allIds };
+  const shelfIds = allIds;
+  console.log("    合计在架 " + shelfIds.length + " 本（官方 " + apiShelfCount +
+    " + Cookie " + cookieShelfCount + "）");
 
   // ★ 目标书：在架的全部（★ 划线多的先做 ★）
   let targets = shelfIds.slice();
@@ -91,10 +162,15 @@ async function main() {
   // ★ 优先做有划线的书（★ 先把内容多的同步进来 ★）
   const withMarks = [];
   for (const id of targets) {
-    try {
-      const pg = await W.getProgress(id, cred);
-      if (pg && (pg.readingTime > 0 || pg.progress > 0)) withMarks.push(id);
-    } catch (e) { /* 忽略 */ }
+    // ★ 双通道：官方 API 优先，失败降级 Cookie ★
+    let pg = null;
+    if (useApi) {
+      try { pg = await API.getProgress(id); } catch (e) { pg = null; }
+    }
+    if (!pg && cred.vid && cred.skey) {
+      try { pg = await W.getProgress(id, cred); } catch (e) { /* 忽略 */ }
+    }
+    if (pg && (pg.readingTime > 0 || pg.overallProgress > 0)) withMarks.push(id);
   }
   if (withMarks.length) {
     targets = withMarks.concat(targets.filter((x) => withMarks.indexOf(x) < 0));
@@ -125,8 +201,15 @@ async function main() {
     // ★ 书籍详情（★ shelf 里没有就单独拉 ★）
     let meta = raw;
     if (!meta.title) {
-      const one = await W.getBookInfo(bookId, cred);
-      if (one) meta = one;
+      // ★ 双通道：官方 API 优先，失败降级 Cookie ★
+      if (useApi) {
+        const one = await API.getBookInfo(bookId);
+        if (one) meta = one;
+      }
+      if (!meta.title && cred.vid && cred.skey) {
+        const one = await W.getBookInfo(bookId, cred);
+        if (one) meta = one;
+      }
     }
     const title = String(meta.title || "").trim();
     if (!title) { nSkip++; continue; }
@@ -144,10 +227,32 @@ async function main() {
 
     // ★ 划线 + 笔记（★ 一次拿全并按 range 关联 ★）
     let bmList = [], rvList = [];
-    try {
-      const r = await W.getMarksAndNotes(bookId, cred);
-      bmList = r.marks; rvList = r.notes;
-    } catch (e) { /* 忽略 */ }
+    let gotMarks = false;
+    // ★★★ 双通道：官方 API 优先（★ API Key 绑的账号 → 云端也能用 ★）★★★ ★
+    if (useApi) {
+      try {
+        const r = await API.getMarksAndNotes(bookId);
+        bmList = r.marks; rvList = r.notes; gotMarks = true;
+      } catch (e) { /* 降级到 Cookie */ }
+    }
+    // ★ Cookie 兜底（★ 官方拿不到时用浏览器登录的账号 ★）
+    if (!gotMarks && cred.vid && cred.skey) {
+      try {
+        const r = await W.getMarksAndNotes(bookId, cred);
+        bmList = r.marks; rvList = r.notes; gotMarks = true;
+      } catch (e) {
+        // ★★★ 认证错误【必须中断】★★★ ★
+        //   ★ 吞掉 → 「划线 0 条」→ 同步到 Notion 的也是 0 → 看起来像【账号没划线】★
+        //   ★ 实际是登录态坏了 → 方向全错 ★
+        if (/登录态失效|账号 ID 无效|没有微信读书凭证|登录超时|用户不存在/.test(String(e.message || ""))) {
+          console.log("");
+          console.log("  ✘ 微信读书认证失效 → 中止同步");
+          console.log("    " + String(e.message).slice(0, 100));
+          console.log("    → 请跑【双击登录微信读书.bat】重新扫码后再同步");
+          throw e;
+        }
+      }
+    }
 
     // ★ 时间关系（★ 用最新一条的时间 ★）
     const allTs = []
@@ -259,7 +364,14 @@ async function main() {
     if (curCat) bprops["分类"] = { relation: [{ id: curCat.id }] };
 
     // ★ 阅读状态（★ 用进度/完成时间判断，比 readState 可靠 ★）
-    const prog = await W.getProgress(bookId, cred);
+    // ★ 双通道：官方 API 优先，失败降级 Cookie ★
+    let prog = null;
+    if (useApi) {
+      try { prog = await API.getProgress(bookId); } catch (e) { prog = null; }
+    }
+    if (!prog && cred.vid && cred.skey) {
+      try { prog = await W.getProgress(bookId, cred); } catch (e) { prog = null; }
+    }
     const readState = Number(meta.readState || 0);
     let stateName = "";
     if (readState === 1) stateName = "在读";
@@ -291,6 +403,12 @@ async function main() {
     if (markIds.length) bprops["划线"] = { relation: markIds };
     if (noteIds.length) bprops["笔记"] = { relation: noteIds };
 
+    // ★★★ 封面 URL 写进属性字段 ★★★ ★
+    //   ★ 原因：Notion【列表视图】不渲染 page.cover → 只显示灰色占位 ★
+    //   ★ 有「封面」URL 字段 → 列表里直接显示缩略图 ★
+    const coverUrl = meta.cover || "";
+    if (coverUrl) bprops["封面"] = { url: String(coverUrl) };
+
     if (DRY) {
       console.log("    · " + title + "（划线 " + markIds.length + " ｜ 笔记 " + noteIds.length + "）");
       nBook++;
@@ -298,12 +416,15 @@ async function main() {
     }
     if (!canWrite) { nSkip++; continue; }
     try {
+      // ★ 封面：默认占位图也设上（★ 至少不是灰色图标 ★）
       if (bookHit) {
         await N.api("/pages/" + bookHit.id, "PATCH", { properties: bprops }, token);
+        if (coverUrl) await N.setCover(bookHit.id, coverUrl, token);
       } else {
-        await N.api("/pages", "POST", {
+        const p = await N.api("/pages", "POST", {
           parent: { type: "data_source_id", data_source_id: N.DS_BOOK },
           properties: bprops,
+          ...(coverUrl ? { cover: { type: "external", external: { url: String(coverUrl) } } } : {}),
         }, token);
       }
       console.log("    ✔ " + title + "（划线 " + markIds.length + " ｜ 笔记 " + noteIds.length + "）");

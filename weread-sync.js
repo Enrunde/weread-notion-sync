@@ -5,30 +5,45 @@
  *
  *  ★ 云端跑（★ GitHub Actions · 电脑关机也能跑）★★
  *  ★ 凭证从环境变量读（★ 不落进仓库 ★）：
+ *    ★ WEREAD_API_KEY  ← ★ 官方 Agent API（★ 首选 ★）★
  *    WEREAD_VID / WEREAD_SKEY / WEREAD_REFRESH_TOKEN / NOTION_TOKEN
- *  ★ ★ skey 约 2 小时过期 → 脚本会用 refreshToken 自动续期 ★★
+ *
+ *  ★★★ 为什么官方 API 是首选 ★★★
+ *   ★ Cookie 方案的 skey 约 2 小时过期 → 靠 refreshToken 续期 ★
+ *   ★ ★ 但微信读书的续期端点【已全 404】→ 云端必然失效 ★
+ *   ★ → 官方 API Key 不依赖 Cookie / 浏览器 / 续期 → ★ 云端能长期跑 ★
  */
 
 const fs = require("fs");
 const path = require("path");
 const W = require("./微信读书接口.js");
 const N = require("./微信读书写Notion.js");
+const API = require("./微信读书官方API.js");
 
 const DRY = process.argv.includes("--干跑");
 const FULL = process.argv.includes("--全部");
 
 /** 把凭证写进「假」的凭证文件 → 让接口模块复用同一套读取逻辑 */
 function injectCreds() {
+  // ★ API Key 走环境变量（★ 官方 API 模块自己读 ★）
+  if (process.env.WEREAD_API_KEY) {
+    console.log("  ✔ WEREAD_API_KEY 已设置（★ 官方 API 通道 ★）");
+  }
   const vid = process.env.WEREAD_VID || "";
   const skey = process.env.WEREAD_SKEY || "";
   const rt = process.env.WEREAD_REFRESH_TOKEN || "";
   if (!vid || !skey) {
-    console.log("  ✘ 缺少 WEREAD_VID / WEREAD_SKEY");
-    process.exitCode = 1;
-    return false;
+    if (!process.env.WEREAD_API_KEY) {
+      console.log("  ✘ 缺少 WEREAD_API_KEY，也没有 WEREAD_VID / WEREAD_SKEY");
+      process.exitCode = 1;
+      return false;
+    }
+    console.log("  ⓘ 没有 Cookie 凭证 → 只用官方 API 通道");
+    return true;
   }
   const line = "vid=" + vid + "\nskey=" + skey + "\nrefreshToken=" + rt + "\n";
   fs.writeFileSync(path.join(__dirname, "微信读书凭证.txt"), line, "utf8");
+  console.log("  ✔ Cookie 凭证已注入（★ 兜底通道 ★）");
   return true;
 }
 

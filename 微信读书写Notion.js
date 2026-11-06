@@ -251,8 +251,25 @@ async function appendBlocks(pageId, blocks, token) {
   return n;
 }
 
+/**
+ * 设置页面封面（★ Notion 的画廊视图用 page.cover 显示大图 ★）
+ * @param {String} pageId
+ * @param {String} url  封面图片 URL
+ */
+async function setCover(pageId, url, token) {
+  if (!pageId || !url) return false;
+  try {
+    await api("/pages/" + pageId, "PATCH", {
+      cover: { type: "external", external: { url: String(url) } },
+    }, token);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 module.exports = {
-  loadToken, api, Store, sleep,
+  loadToken, api, Store, sleep, setCover,
   DS_BOOK, DS_MARK, DS_NOTE, DS_TAG, DS_AUTHOR, DS_CAT, DS_YEAR, DS_MONTH, DS_WEEK,
   ts2iso, ymd2iso, timeKeys, markBlocks, noteBlocks, clearChildren, appendBlocks,
 };

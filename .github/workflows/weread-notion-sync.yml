@@ -31,6 +31,9 @@ jobs:
 
       - name: 同步 微信读书 → Notion
         env:
+          # ★ 官方 Agent API（★ 首选：不依赖 Cookie / 浏览器 / 续期端点 ★）
+          WEREAD_API_KEY: ${{ secrets.WEREAD_API_KEY }}
+          # Cookie 兜底（★ 官方 API 不可用时才用 ★）
           WEREAD_VID: ${{ secrets.WEREAD_VID }}
           WEREAD_SKEY: ${{ secrets.WEREAD_SKEY }}
           WEREAD_REFRESH_TOKEN: ${{ secrets.WEREAD_REFRESH_TOKEN }}
@@ -44,7 +47,7 @@ jobs:
           script: |
             const title = '微信读书 → Notion 同步失败'
             const body = `自动同步失败，请检查：
-            - secret WEREAD_SKEY 是否有效（过期会自动续期，续期失败要重新扫码）
+            - secret WEREAD_API_KEY 是否有效（★ 首选通道 ★）
             - secret NOTION_TOKEN 对应的 integration 是否已分享「微信读书知识库」
             - 手动运行：node weread-sync.js --干跑
             时间：${new Date().toISOString()}`

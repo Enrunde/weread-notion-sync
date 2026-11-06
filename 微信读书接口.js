@@ -123,16 +123,91 @@ async function refresh(cred) {
       return true;
     }
   } catch (e) { /* 忽略 */ }
-  return false;
+  // ★★★ HTTP 续期端点已失效（★ 实测 /api/login/refresh 全 404 ★）→ 走 CDP 兜底 ★★★
+  return await refreshViaCDP(cred);
+}
+
+/**
+ * ★★★ CDP 兜底续期（★ HTTP 端点 404 时的唯一可行路 ★）★★
+ *
+ *  ★ 原理：微信读书 HTTP 续期接口已下线 → 但浏览器里的 Cookie 仍是活的 ★
+ *   → 通过 Chrome DevTools Protocol 从【专用 profile】里读最新 Cookie ★
+ *   → wr_skey 就是新的 skey，wr_vid 是真正的账号 ID ★
+ *
+ *  ★ 前提：专用 profile 的浏览器还在跑（微信读书登录.js 启动的那个）★
+ *   → 没跑就返回 false → 提示用户重新扫码 ★
+ */
+async function refreshViaCDP(cred) {
+  const PORT = 9333;
+  const PROFILE_DIR = path.join(SYNC, "_weread_chrome_profile");
+  try {
+    // ① CDP 是否可用
+    let targets = [];
+    try {
+      const r = await fetch(`http://127.0.0.1:${PORT}/json/list`);
+      if (!r.ok) return false;
+      targets = await r.json();
+    } catch (e) {
+      return false;
+    }
+    const page = targets.find((t) => t.type === "page" && t.webSocketDebuggerUrl);
+    if (!page) return false;
+
+    // ② 读 Cookie
+    const cookies = await new Promise((resolve, reject) => {
+      let ws;
+      try { ws = new WebSocket(page.webSocketDebuggerUrl); } catch (e) { return reject(e); }
+      const timer = setTimeout(() => {
+        try { ws.close(); } catch (e) { /* ignore */ }
+        reject(new Error("CDP 超时"));
+      }, 15000);
+      ws.onopen = () => ws.send(JSON.stringify({ id: 1, method: "Network.getAllCookies" }));
+      ws.onmessage = (ev) => {
+        let msg = null;
+        try { msg = JSON.parse(ev.data); } catch (e) { /* ignore */ }
+        if (msg && msg.id === 1) {
+          clearTimeout(timer);
+          try { ws.close(); } catch (e) { /* ignore */ }
+          if (msg.error) return reject(new Error(msg.error.message || "CDP 错误"));
+          resolve(msg.result && msg.result.cookies ? msg.result.cookies : []);
+        }
+      };
+      ws.onerror = () => { clearTimeout(timer); reject(new Error("WebSocket 连接失败")); };
+    });
+
+    // ③ 挑出 wr_vid / wr_skey / wr_rt
+    const pick = {};
+    for (const c of cookies) {
+      const d = String(c.domain || "");
+      if (d.indexOf("weread.qq.com") < 0) continue;
+      const n = String(c.name || "");
+      if (n === "wr_vid" || n === "wr_skey" || n === "wr_rt" || n === "wr_localvid") {
+        pick[n] = String(c.value || "").trim();
+      }
+    }
+    // ★ 必须有 wr_vid（账号 ID）→ 只有 wr_localvid 的话 API 会报「用户不存在」★
+    if (!pick.wr_skey || !pick.wr_vid) return false;
+
+    cred.vid = pick.wr_vid;
+    cred.skey = pick.wr_skey;
+    if (pick.wr_rt) cred.refreshToken = pick.wr_rt;
+    saveCred(cred);
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function isAuthExpired(status, json) {
   if (status === 401) return true;
   const code = json && (json.errcode ?? json.errCode);
-  return Number(code) === -2012;
+  // ★★ -2012 = 登录超时；-2010 = 「用户不存在」→ 都是认证问题 ★★
+  //   ★ -2010 的成因：vid 存成了设备 ID（wr_localvid）而不是账号 ID（wr_vid）★
+  //   ★ → 续期（CDP）能同时修好两个 ★
+  return Number(code) === -2012 || Number(code) === -2010;
 }
 
-/** 统一请求（★ 401 时自动续期重试一次 ★）*/
+/** 统一请求（★ 认证失效时自动续期重试一次 ★）*/
 async function req(method, apiPath, body, cred) {
   const c = cred || _cred || (_cred = readCred());
   if (!c.vid || !c.skey) throw new Error("没有微信读书凭证（先跑 微信读书登录.js）");
@@ -154,7 +229,12 @@ async function req(method, apiPath, body, cred) {
     if (await refresh(c)) {
       res = await doOnce();
     } else {
-      throw new Error("微信读书登录态失效 → 请重跑 微信读书登录.js 扫码");
+      const code = res.json && (res.json.errcode ?? res.json.errCode);
+      if (Number(code) === -2010) {
+        throw new Error("微信读书：账号 ID 无效（vid 是设备 ID 不是账号 ID）" +
+          " → 请跑 双击登录微信读书.bat 重新扫码");
+      }
+      throw new Error("微信读书登录态失效 → 请跑 双击登录微信读书.bat 重新扫码");
     }
   }
   if (res.status >= 400) {
@@ -164,7 +244,7 @@ async function req(method, apiPath, body, cred) {
   const code = res.json && (res.json.errcode ?? res.json.errCode);
   if (code !== undefined && Number(code) !== 0) {
     throw new Error("接口报错 " + code + " → " +
-      String(res.json.errmsg || res.json.errMsg || "").slice(0, 120));
+      String(res.json.errmsg || res.json.errmsg || res.json.errMsg || "").slice(0, 120));
   }
   return res.json;
 }
@@ -372,8 +452,19 @@ async function getReviews(bookId, cred) {
         type: rv.type || 0,
       });
     }
-  } catch (e) { /* 没有笔记就返回空 */ }
-  return out;
+  } catch (e) {
+    // ★★★ 认证错误【不能吞】★★★ ★
+    //   ★ 吞掉 → 「划线 0 条」看起来像「账号没划线」→ 误判方向全错 ★
+    //   ★ 只有【真的没有笔记】才返回空 ★
+    if (isAuthError(e)) throw e;
+    return [];
+  }
+}
+
+/** ★ 这个错误是不是认证问题（★ 决定要不要往上抛 ★）*/
+function isAuthError(e) {
+  const m = String((e && e.message) || "");
+  return /登录态失效|账号 ID 无效|没有微信读书凭证|登录超时|用户不存在/.test(m);
 }
 
 /**
@@ -416,6 +507,9 @@ async function getProgress(bookId, cred) {
       timestamp: j.timestamp || 0,
     };
   } catch (e) {
+    // ★★★ 认证错误【不能吞】★★★ ★
+    //   ★ 吞掉 → 进度显示 0 → 看起来像「没读过」→ 误判 ★
+    if (isAuthError(e)) throw e;
     return null;
   }
 }

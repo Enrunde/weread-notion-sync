@@ -8,7 +8,8 @@ const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
 
-const SYNC = path.join(__dirname, "..");
+// ★ 仓库搬到 vault 外（D:/Obsidian/同步仓库/）→ 避免 Obsidian Sync 同步 .git ★
+const SYNC = path.join(path.dirname(path.dirname(__dirname)), "Notes", "系统附件", "同步");
 const REPO = "Enrunde/weread-notion-sync";
 const GH = path.join(
   process.env.LOCALAPPDATA || "",
@@ -42,6 +43,16 @@ function readCred() {
   return out;
 }
 
+/** 读 API Key（★ 官方 Agent API 用，★ 云端不需要浏览器 ★）*/
+function readApiKey() {
+  const p = path.join(SYNC, "微信读书APIKey.txt");
+  if (!fs.existsSync(p)) return "";
+  try {
+    const m = /wrk-[A-Za-z0-9_-]+/.exec(fs.readFileSync(p, "utf8"));
+    return m ? m[0] : "";
+  } catch (e) { return ""; }
+}
+
 /** 读 Notion token（★ 从 notion-date-fix 仓库的 secret 拿不到本地文件 → 从 ~/.config ★）*/
 function readNotionToken() {
   const p = path.join(process.env.HOME || process.env.USERPROFILE || "", ".config", "notion", "token");
@@ -53,12 +64,18 @@ function main() {
   console.log("═══ 微信读书云端仓库部署 ═══\n");
 
   const cred = readCred();
-  if (!cred.vid || !cred.skey) {
-    console.log("  ✘ 没有本机凭证");
-    console.log("    → 先双击「双击登录微信读书.bat」扫码登录");
+  const apiKey = readApiKey();
+  // ★★★ API Key 是【首选】★★★ ★
+  //   ★ 官方 Agent API 不依赖 Cookie / 浏览器 / 续期端点 → 云端能长期跑 ★
+  //   ★ Cookie 方案：续期端点已 404 → 云端必然失效 → 只当兜底 ★
+  if (!apiKey && (!cred.vid || !cred.skey)) {
+    console.log("  ✘ 没有可用凭证");
+    console.log("    → 需要 API Key（微信读书APIKey.txt）");
+    console.log("    → 或双击「双击登录微信读书.bat」扫码（仅本机可用）");
     return;
   }
-  console.log("  ✔ 读到凭证：vid=" + cred.vid + "  skey=" + cred.skey.slice(0, 6) + "…");
+  if (apiKey) console.log("  ✔ 读到 API Key：" + apiKey.slice(0, 12) + "…（★ 云端首选 ★）");
+  if (cred.vid && cred.skey) console.log("  ✔ 读到 Cookie 凭证：vid=" + cred.vid + "（★ 兜底 ★）");
 
   const nt = readNotionToken();
   if (!nt) {
@@ -88,7 +105,8 @@ function main() {
   console.log("");
   console.log("  ── ② 传凭证为 secret ──");
   const secrets = [
-    ["WEREAD_VID", cred.vid],
+    ["WEREAD_API_KEY", apiKey],                 // ★ 官方 API（★ 首选 ★）
+    ["WEREAD_VID", cred.vid],                    // Cookie 兜底
     ["WEREAD_SKEY", cred.skey],
     ["WEREAD_REFRESH_TOKEN", cred.refreshToken],
     ["NOTION_TOKEN", nt],
@@ -106,7 +124,8 @@ function main() {
   // ③ 推代码
   console.log("");
   console.log("  ── ③ 推代码 ──");
-  const dir = path.join(SYNC, "weread-notion-sync");
+  // ★ 仓库在 vault 外（D:/Obsidian/同步仓库/）→ 避免 Obsidian Sync 同步 .git ★
+  const dir = path.join(path.dirname(path.dirname(__dirname)), "同步仓库", "weread-notion-sync");
   const run = (args) => {
     try { return sh("git", args, { cwd: dir }); } catch (e) { return ""; }
   };
