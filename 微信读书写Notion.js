@@ -47,6 +47,8 @@ const DS_WEEK = "ece92bf9-b4d9-82d3-9776-071dfbe65bec";   // 周
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function loadToken() {
+  // ★ 云端（GitHub Actions）用环境变量，本机用文件 ★
+  if (process.env.NOTION_TOKEN) return String(process.env.NOTION_TOKEN).trim();
   return fs.readFileSync(TOKEN_FILE, "utf8").trim();
 }
 

@@ -36,6 +36,16 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ══════════════════════════════════════════════════
 function readCred() {
   const cred = { vid: "", skey: "", refreshToken: "" };
+
+  // ★★ 云端（GitHub Actions）优先用环境变量 ★★
+  if (process.env.WEREAD_VID || process.env.WEREAD_SKEY) {
+    return {
+      vid: String(process.env.WEREAD_VID || "").trim(),
+      skey: String(process.env.WEREAD_SKEY || "").trim(),
+      refreshToken: String(process.env.WEREAD_REFRESH_TOKEN || "").trim(),
+    };
+  }
+
   if (!fs.existsSync(CRED_FILE)) return cred;
   try {
     const txt = fs.readFileSync(CRED_FILE, "utf8");
