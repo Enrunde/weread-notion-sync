@@ -139,7 +139,11 @@ async function refresh(cred) {
  */
 async function refreshViaCDP(cred) {
   const PORT = 9333;
-  const PROFILE_DIR = path.join(SYNC, "_weread_chrome_profile");
+  // ★ 与 微信读书登录.js 保持一致（★ profile 已搬到 vault 外 ★）
+  const PROFILE_DIR = path.join(
+    path.dirname(path.dirname(path.dirname(__dirname))),
+    "同步仓库", "weread_chrome_profile"
+  );
   try {
     // ① CDP 是否可用
     let targets = [];
