@@ -97,12 +97,12 @@ class Store {
   async load(token) {
     let cur = null;
     do {
-      const q = await api(
-        "/data_sources/" + this.dsId + "/query" + (cur ? "?start_cursor=" + cur : ""),
-        "POST",
-        cur ? {} : { page_size: 100 },
-        token
-      );
+      // ★★★ 2026-11-07 修：start_cursor 必须放在【body】里 ★★★ ★
+      //   ★ 之前拼在 URL query 上 → Notion 2025-09-03 报 validation_error ★
+      //   ★ → 库里有 100+ 条就要翻页 → 一翻页就 400 → ★ 云端同步直接 exit 1 ★
+      const body = { page_size: 100 };
+      if (cur) body.start_cursor = cur;
+      const q = await api("/data_sources/" + this.dsId + "/query", "POST", body, token);
       for (const p of q.results || []) {
         const pr = p.properties || {};
         const key = this._txt(pr[this.keyProp]);
