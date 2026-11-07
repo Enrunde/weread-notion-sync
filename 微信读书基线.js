@@ -62,14 +62,23 @@ function getEntry(baseline, key) {
   return (baseline && baseline[key]) || {};
 }
 
-/** 记某条的基线 */
-function setEntry(baseline, key, notionVals, srcVals) {
+/**
+ * ★ 记某条的基线
+ * @param {Object} extra 附加信息 {A: 活动指纹, M: 划线id[], T: 笔记id[]}
+ */
+function setEntry(baseline, key, notionVals, srcVals, extra) {
   if (!key) return;
-  baseline[key] = {
+  const e = {
     N: notionVals || {},   // ★ 上次同步后的 Notion 值 ★
     S: srcVals || {},      // ★ 上次同步时的源值（★ 微信读书 ★）★
     t: Date.now(),
   };
+  if (extra) {
+    if (extra.A !== undefined) e.A = extra.A;      // ★ 阅读活动指纹 ★
+    if (extra.M !== undefined) e.M = extra.M;      // ★ 划线 page id 列表 ★
+    if (extra.T !== undefined) e.T = extra.T;      // ★ 笔记 page id 列表 ★
+  }
+  baseline[key] = e;
 }
 
 function eq(a, b) {
