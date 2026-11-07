@@ -70,13 +70,34 @@ function hasApiKey() {
  * @param {object} params   业务参数（★ 平铺在 body 顶层 ★）
  * @returns {Promise<object>}
  */
+/**
+ * ★★★ 请求节流（★ 2026-11-07 新增 ★）★★★
+ *   ★ 为什么要：★ 全量同步 107 本书 = 300+ 次请求 → 必撞「频率超限 -2014」★
+ *   ★ 表现：HTTP 499 → 抛错 → 降级 Cookie → 整个同步中止 ✘✘✘ ★
+ *   ★ 做法：★ 全局最小间隔（默认 350ms）→ 主动慢下来，不撞限流 ★
+ *   ★ 限流是【账号级】的 → 全局串行排队最稳 ★
+ */
+let _lastReqAt = 0;
+let _minGap = 350;
+function setMinGap(ms) {
+  const n = Number(ms);
+  if (n > 0) _minGap = n;
+}
+async function throttle() {
+  const now = Date.now();
+  const wait = _lastReqAt + _minGap - now;
+  if (wait > 0) await sleep(wait);
+  _lastReqAt = Date.now();
+}
+
 async function gw(apiName, params, opt) {
   const key = (opt && opt.apiKey) || readApiKey();
   if (!key) throw new Error("没有微信读书 API Key（跑 双击登录微信读书.bat 或写入 微信读书APIKey.txt）");
 
   const body = Object.assign({ api_name: apiName, skill_version: SKILL_VERSION }, params || {});
 
-  for (let attempt = 1; attempt <= 4; attempt++) {
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    await throttle();
     const r = await fetch(GATEWAY, {
       method: "POST",
       headers: {
@@ -89,13 +110,26 @@ async function gw(apiName, params, opt) {
     let j = null;
     try { j = JSON.parse(t); } catch (e) { j = { _raw: t.slice(0, 300) }; }
 
-    if (r.status === 429) {
-      await sleep(2000 * attempt);
+    // ★★★ 频率超限：★ HTTP 429 或 HTTP 499 + errcode -2014 ★★★ ★
+    //   ★ 微信读书的限流【不】返回 429，而是 499 + errcode -2014 ★
+    //   ★ 之前只认 429 → 限流直接抛错 → 降级 Cookie → 整个同步中止 ✘✘✘ ★
+    const code0 = j && j.errcode !== undefined ? Number(j.errcode) : 0;
+    const rateLimited =
+      r.status === 429 ||
+      r.status === 499 ||
+      code0 === -2014 ||
+      /频率超限|请求过于频繁|too many requests/i.test(String((j && j.errmsg) || "") + " " + t);
+    if (rateLimited) {
+      // ★ 指数退避：2s / 4s / 8s / 16s ★
+      if (attempt >= 5) {
+        throw new Error("微信读书 API 频率超限（重试 5 次仍失败）→ 稍后再跑一次即可");
+      }
+      await sleep(Math.min(2000 * Math.pow(2, attempt - 1), 30000));
       continue;
     }
     if (!r.ok) throw new Error("微信读书 API HTTP " + r.status + " → " + t.slice(0, 200));
 
-    const code = j.errcode !== undefined ? Number(j.errcode) : 0;
+    const code = code0;
     if (code !== 0) {
       throw new Error("微信读书 API 报错 " + code + " → " + String(j.errmsg || j.errMsg || "").slice(0, 120));
     }
@@ -253,7 +287,7 @@ async function getBookInfo(bookId, opt) {
 }
 
 module.exports = {
-  readApiKey, saveApiKey, hasApiKey, gw,
+  readApiKey, saveApiKey, hasApiKey, gw, setMinGap,
   getShelf, getNotebooks, getBookmarks, getReviews, getMarksAndNotes, getProgress, getBookInfo,
   GATEWAY, SKILL_VERSION, APIKEY_FILE,
 };
