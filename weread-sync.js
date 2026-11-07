@@ -86,7 +86,7 @@ function injectCreds() {
         // ★★★ 2026-11-07：★ 基线存进 Notion（★ 不依赖 git，跨机器一致 ★）★★★
         WEREAD_BASELINE_TO_NOTION: "1",
         // ★ 请求节流间隔（★ 350ms → 107 本约 2 分钟，不撞频率限流 ★）
-        WEREAD_MIN_GAP: process.env.WEREAD_MIN_GAP || "350",
+        WEREAD_MIN_GAP: process.env.WEREAD_MIN_GAP || "900",
       },
     });
     console.log(out);
