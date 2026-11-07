@@ -115,7 +115,7 @@ async function main() {
   // ★★★ 请求节流（★ 2026-11-07 ★）★★★ ★
   //   ★ 全量同步 = 107 本 × 3 次请求 ≈ 320 次 → 不节流必撞「频率超限 -2014」★
   //   ★ 350ms 间隔 → 约 2 分钟跑完 107 本，安全不撞限流 ★
-  const MIN_GAP = Number(process.env.WEREAD_MIN_GAP || 350);
+  const MIN_GAP = Number(process.env.WEREAD_MIN_GAP || 900);
   API.setMinGap(MIN_GAP);
   const shelfMap = {};          // bookId → 书籍概要
   const allIds = [];
@@ -193,25 +193,10 @@ async function main() {
   let targets = shelfIds.slice();
 
   // ★ 优先做有划线的书（★ 先把内容多的同步进来 ★）
-  const withMarks = [];
-  for (const id of targets) {
-    // ★ 双通道：官方 API 优先，失败降级 Cookie ★
-    // ★★★ 2026-11-07：★ 这里的探测【只是排序用】★ ★
-    //   ★ → 拿不到就当「没读过」→ 排在后面 → 不影响数据正确性 ★
-    //   ★ → 但会多发 107 次请求 → 撞限流的风险 ★ → 限流就跳过 ★
-    let pg = null;
-    if (useApi) {
-      try { pg = await API.getProgress(id); } catch (e) { pg = null; }
-    }
-    if (!pg && cred.vid && cred.skey && !cookieAuthDead) {
-      try { pg = await W.getProgress(id, cred); } catch (e) { /* 忽略 */ }
-    }
-    if (pg && (pg.readingTime > 0 || pg.overallProgress > 0)) withMarks.push(id);
-  }
-  if (withMarks.length) {
-    targets = withMarks.concat(targets.filter((x) => withMarks.indexOf(x) < 0));
-    console.log("    ★ " + withMarks.length + " 本读过（优先同步）");
-  }
+  // ★★★ 2026-11-07：★ 删掉了「优先探测」阶段 ★★★ ★
+  //   ★ 原因：★ 它【单独】给每本书发一次 getProgress → 107 次额外请求 ★
+  //   ★   → 全量同步变成 320+ 次 → ★ 必撞微信 WAF 限流（HTTP 403）★
+  //   ★ 现在：★ 进度在主循环里拉（★ 复用，不重复 ★）→ 少 107 次请求 ★
 
   if (ONLY) {
     targets = targets.filter((id) => {
@@ -264,8 +249,45 @@ async function main() {
     // ★ 划线 + 笔记（★ 一次拿全并按 range 关联 ★）
     let bmList = [], rvList = [];
     let gotMarks = false;
-    // ★★★ 双通道：官方 API 优先（★ API Key 绑的账号 → 云端也能用 ★）★★★ ★
+
+    // ════════════════════════════════════════════════════════════
+    //  ★★★ 2026-11-07：★ 增量筛选（★ 省请求 ★）★★★
+    //   ★ 问题：★ 107 本 × 3 次请求 = 320 次 → ★ 必撞微信 WAF 限流（403）★
+    //   ★ 做法：★ 先拉进度（1 次）→ 和基线比「阅读活动指纹」★
+    //   ★        指纹没变 → ★ 这本书这轮没动 → 跳过拉划线+笔记（省 2 次）★
+    //   ★ 效果：★ 常规同步 107 次（进度）+ 少量活跃书的划线 → 不撞限流 ★
+    // ════════════════════════════════════════════════════════════
+    let prog = null;
     if (useApi) {
+      try { prog = await API.getProgress(bookId); } catch (e) { prog = null; }
+    }
+    if (!prog && cred.vid && cred.skey && !cookieAuthDead) {
+      try { prog = await W.getProgress(bookId, cred); } catch (e) { prog = null; }
+    }
+    // ★ 阅读活动指纹（★ 变了就说明这轮有活动 ★）
+    const actSig = prog
+      ? [Number(prog.readingTime || 0), Number(prog.overallProgress || 0),
+         Number(prog.finishTime || 0), Number(prog.startReadingTime || 0),
+         Number(prog.updateTime || 0)].join("|")
+      : "";
+    const baseEntry0 = BASE.getEntry(baseline, String(bookId));
+    const lastActSig = (baseEntry0 && baseEntry0.A) || "";
+    // ★ 没有基线（首次）→ 必须拉（★ 否则一条划线都同步不进来 ★）
+    // ★ 有基线且指纹没变 → 跳过划线（★ 省 2 次请求 ★）
+    const skipMarks = !!(lastActSig && actSig && lastActSig === actSig && !FULL);
+    if (skipMarks) {
+      // ★ 复用基线里的划线/笔记 id（★ 不重新拉 ★）
+      markIds.length = 0; noteIds.length = 0;
+      const prevMarks = (baseEntry0 && baseEntry0.M) || [];
+      const prevNotes = (baseEntry0 && baseEntry0.T) || [];
+      for (const pid of prevMarks) markIds.push({ id: pid });
+      for (const pid of prevNotes) noteIds.push({ id: pid });
+      bmList = []; rvList = [];
+      gotMarks = true;
+    }
+
+    // ★★★ 双通道：官方 API 优先（★ API Key 绑的账号 → 云端也能用 ★）★★★ ★
+    if (!skipMarks && useApi) {
       try {
         const r = await API.getMarksAndNotes(bookId);
         bmList = r.marks; rvList = r.notes; gotMarks = true;
@@ -442,14 +464,8 @@ async function main() {
     if (curCat) bprops["分类"] = { relation: [{ id: curCat.id }] };
 
     // ★ 阅读状态（★ 用进度/完成时间判断，比 readState 可靠 ★）
-    // ★ 双通道：官方 API 优先，失败降级 Cookie ★
-    let prog = null;
-    if (useApi) {
-      try { prog = await API.getProgress(bookId); } catch (e) { prog = null; }
-    }
-    if (!prog && cred.vid && cred.skey && !cookieAuthDead) {
-      try { prog = await W.getProgress(bookId, cred); } catch (e) { prog = null; }
-    }
+    // ★★★ 2026-11-07：★ prog 已在【上面】拉过了（★ 增量筛选时拉的 ★）★★★
+    //   ★ 这里直接复用 → ★ 不重复发请求（★ 省 107 次 ★）
     const readState = Number(meta.readState || 0);
     let stateName = "";
     if (readState === 1) stateName = "在读";
@@ -534,7 +550,8 @@ async function main() {
         if (!nFields && !coverChanged) {
           nSkip++;
           // ★ 基线照旧记（★ 记录这次看到的 Notion 值 ★）
-          BASE.setEntry(baseline, String(bookId), nowFlat, srcFlat);
+          BASE.setEntry(baseline, String(bookId), nowFlat, srcFlat,
+            { A: actSig, M: markIds.map((x) => x.id), T: noteIds.map((x) => x.id) });
           continue;
         }
         if (nFields) {
@@ -551,7 +568,8 @@ async function main() {
         for (const f of Object.keys(writeProps)) {
           mergedSnap[f] = srcFlat[f];
         }
-        BASE.setEntry(baseline, String(bookId), mergedSnap, srcFlat);
+        BASE.setEntry(baseline, String(bookId), mergedSnap, srcFlat,
+          { A: actSig, M: markIds.map((x) => x.id), T: noteIds.map((x) => x.id) });
         console.log("    ✔ " + title + "（更新 " + nFields + " 项" +
           (coverChanged && coverUrl ? " + 封面" : "") +
           (mg.kept.length ? "｜保留你的修改 " + mg.kept.join("、") : "") +
@@ -565,7 +583,8 @@ async function main() {
           ...(coverUrl ? { cover: { type: "external", external: { url: String(coverUrl) } } } : {}),
         }, token);
         books.byKey.set(String(bookId), { id: p.id, url: p.url, title, snap: srcFlat });
-        BASE.setEntry(baseline, String(bookId), srcFlat, srcFlat);
+        BASE.setEntry(baseline, String(bookId), srcFlat, srcFlat,
+          { A: actSig, M: markIds.map((x) => x.id), T: noteIds.map((x) => x.id) });
         console.log("    ✔ " + title + "（新建｜划线 " + markIds.length + " ｜ 笔记 " + noteIds.length + "）");
       }
       nBook++;
