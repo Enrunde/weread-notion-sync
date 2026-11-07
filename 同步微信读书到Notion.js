@@ -267,6 +267,59 @@ async function main() {
     const noteIds = [];
 
     // ★ 写「划线」 ──
+    // ★★★ 2026-11-07：★ 先写笔记，再写划线 ★★★ ★
+    //   ★ 原来先写划线 → 写划线时笔记还不存在 → 挂不上「笔记」关系 ★
+    //   ★ → 划线变成孤儿，笔记也不知道自己属于哪条划线 ★
+    //   ★ 现在：① 先写笔记（拿到 pageId，按 range 建索引）★
+    //     ★ ② 再写划线 → 用 range 查索引 → 挂上「笔记」relation ★
+    //   ★ 顺序不能反：Notion relation 必须指向已存在的页面 ★
+    const markIdByRange = new Map();   // range → 划线页 id
+    const noteIdByRange = new Map();   // range → 笔记页 id
+
+    // ★ 写「笔记」 ──
+    for (const rv of rvList) {
+      if (!rv.id) continue;
+      const hit = notes.find(rv.id, null);
+      const noteTitle = String(rv.content || rv.abstract || "").slice(0, 190) || "（空笔记）";
+      const props = {
+        "标题": { title: [{ type: "text", text: { content: noteTitle } }] },
+        "笔记ID": { rich_text: [{ type: "text", text: { content: rv.id } }] },
+      };
+      const tk = rv.updateTime || rv.createTime ? N.timeKeys(rv.updateTime || rv.createTime) : curTk;
+      if (tk) {
+        const y = await ensureTime(years, tk.year, token);
+        const mo = await ensureTime(months, tk.month, token);
+        const wk = await ensureTime(weeks, tk.week, token);
+        if (y) props["年"] = { relation: [{ id: y.id }] };
+        if (mo) props["月"] = { relation: [{ id: mo.id }] };
+        if (wk) props["周"] = { relation: [{ id: wk.id }] };
+      }
+      if (DRY) { nNote++; noteIds.push({ id: "dry" }); if (rv.range) noteIdByRange.set(rv.range, "dry"); continue; }
+      if (!canWrite) { nSkip++; continue; }
+      try {
+        let pageId = hit ? hit.id : null;
+        if (hit) {
+          await N.api("/pages/" + hit.id, "PATCH", { properties: props }, token);
+        } else {
+          const p = await N.api("/pages", "POST", {
+            parent: { type: "data_source_id", data_source_id: N.DS_NOTE },
+            properties: props,
+          }, token);
+          pageId = p.id;
+          notes.byKey.set(rv.id, { id: p.id, url: p.url, title: noteTitle });
+          const blocks = N.noteBlocks(rv);
+          if (blocks.length) await N.appendBlocks(p.id, blocks, token);
+        }
+        noteIds.push({ id: pageId });
+        // ★ 记录 range → 笔记 id（★ 供划线挂关系 ★）
+        if (rv.range) noteIdByRange.set(rv.range, pageId);
+        nNote++;
+      } catch (e) {
+        console.log("    ✘ 笔记 " + rv.id + " → " + String(e.message).slice(0, 90));
+      }
+    }
+
+    // ★ 写「划线」 ──
     for (const bm of bmList) {
       if (!bm.id) continue;
       const hit = marks.find(bm.id, null);
@@ -279,6 +332,9 @@ async function main() {
       if (curAuthor) rel.push({ id: curAuthor.id });
       if (rel.length) props["作者"] = { relation: rel };
       if (curCat) props["分类"] = { relation: [{ id: curCat.id }] };
+      // ★★ 挂上关联的笔记（★ 按 range 匹配 ★）★★
+      const noteRel = bm.range && noteIdByRange.get(bm.range);
+      if (noteRel && noteRel !== "dry") props["笔记"] = { relation: [{ id: noteRel }] };
       const tk = bm.updateTime ? N.timeKeys(bm.updateTime) : curTk;
       if (tk) {
         const y = await ensureTime(years, tk.year, token);
@@ -305,52 +361,30 @@ async function main() {
           if (blocks.length) await N.appendBlocks(p.id, blocks, token);
         }
         markIds.push({ id: pageId });
+        if (bm.range) markIdByRange.set(bm.range, pageId);
         nMark++;
       } catch (e) {
         console.log("    ✘ 划线 " + bm.id + " → " + String(e.message).slice(0, 90));
       }
     }
 
-    // ★ 写「笔记」 ──
+    // ★★★ 回填：把笔记挂到对应的划线上（★ 反向关系 ★）★★★ ★
+    //   ★ Notion 的 relation 是单向存储的 → 写划线时挂笔记还不够 ★
+    //   ★ 笔记页自己的「划线」relation 也得写上 → 双向都能看到 ★
     for (const rv of rvList) {
-      if (!rv.id) continue;
-      const hit = notes.find(rv.id, null);
-      const noteTitle = String(rv.content || "").slice(0, 190) || "（空笔记）";
-      const props = {
-        "标题": { title: [{ type: "text", text: { content: noteTitle } }] },
-        "笔记ID": { rich_text: [{ type: "text", text: { content: rv.id } }] },
-      };
-      const tk = rv.updateTime ? N.timeKeys(rv.updateTime) : curTk;
-      if (tk) {
-        const y = await ensureTime(years, tk.year, token);
-        const mo = await ensureTime(months, tk.month, token);
-        const wk = await ensureTime(weeks, tk.week, token);
-        if (y) props["年"] = { relation: [{ id: y.id }] };
-        if (mo) props["月"] = { relation: [{ id: mo.id }] };
-        if (wk) props["周"] = { relation: [{ id: wk.id }] };
-      }
-      if (DRY) { nNote++; noteIds.push({ id: "dry" }); continue; }
-      if (!canWrite) { nSkip++; continue; }
+      if (!rv.range) continue;
+      const markId = markIdByRange.get(rv.range);
+      const noteId = noteIdByRange.get(rv.range);
+      if (!markId || !noteId || markId === "dry" || noteId === "dry") continue;
       try {
-        let pageId = hit ? hit.id : null;
-        if (hit) {
-          await N.api("/pages/" + hit.id, "PATCH", { properties: props }, token);
-        } else {
-          const p = await N.api("/pages", "POST", {
-            parent: { type: "data_source_id", data_source_id: N.DS_NOTE },
-            properties: props,
-          }, token);
-          pageId = p.id;
-          notes.byKey.set(rv.id, { id: p.id, url: p.url, title: noteTitle });
-          const blocks = N.noteBlocks(rv);
-          if (blocks.length) await N.appendBlocks(p.id, blocks, token);
-        }
-        noteIds.push({ id: pageId });
-        nNote++;
+        await N.api("/pages/" + noteId, "PATCH", {
+          properties: { "划线": { relation: [{ id: markId }] } },
+        }, token);
       } catch (e) {
-        console.log("    ✘ 笔记 " + rv.id + " → " + String(e.message).slice(0, 90));
+        console.log("    ⚠ 笔记←划线 关系回填失败：" + String(e.message).slice(0, 70));
       }
     }
+
 
     // ★ 写「书籍」 ──
     const bprops = {
