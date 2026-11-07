@@ -24,6 +24,8 @@ const path = require("path");
 const SYNC = __dirname;
 const W = require(path.join(SYNC, "微信读书接口.js"));
 const N = require(path.join(SYNC, "微信读书写Notion.js"));
+// ★★★ 三方合并基线（★ 支撑「Notion 端改动不被覆盖」+「不重复刷新」★★★ ★
+const BASE = require(path.join(SYNC, "微信读书基线.js"));
 
 const DRY = process.argv.includes("--干跑");
 const FULL = process.argv.includes("--全部");
@@ -38,6 +40,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // ══════════════════════════════════════════════════
 async function main() {
   console.log("═══ 微信读书 → Notion「微信读书知识库」同步 ═══\n");
+
+  // ★ 2026-11-07：★ Cookie 通道一旦认证失效 → 后续不再用它（★ 官方 API 兜着 ★）
+  //   ★ 必须在这里声明（★ 前面「优先探测」阶段也要用 ★）
+  let cookieAuthDead = false;
 
   // ★ 凭证（★ Cookie 通道用；官方 API 用 API Key，两者独立 ★）
   const cred = W.readCred();
@@ -54,6 +60,28 @@ async function main() {
   const weeks = new N.Store(N.DS_WEEK, null, "标题");
 
   let canWrite = true;
+  // ★★★ 2026-11-07：★ 加载三方合并基线 ★★★ ★
+  //   ★ 云端：从 Notion 读（★ 不依赖 git ★）★
+  //   ★ 本地：从文件读（★ D:/Obsidian/同步状态/微信读书基线.json ★）
+  let baseline = {};
+  try {
+    if (process.env.WEREAD_BASELINE_TO_NOTION) {
+      const b = await BASE.loadBaselineFromNotion(N.api, N.DS_TAG, token);
+      if (b) {
+        baseline = b;
+        console.log("  基线从 Notion 读回（" + Object.keys(baseline).length + " 条）");
+      } else {
+        baseline = BASE.readBaseline();
+        console.log("  ⓘ Notion 里还没有基线 → 用本地文件（" + Object.keys(baseline).length + " 条）");
+      }
+    } else {
+      baseline = BASE.readBaseline();
+      console.log("  基线：" + Object.keys(baseline).length + " 条");
+    }
+  } catch (e) {
+    baseline = {};
+    console.log("  ⚠ 基线读不到（" + String(e.message).slice(0, 60) + "）→ 首次同步模式");
+  }
   try {
     const n = await books.load(token);
     await marks.load(token);
@@ -84,6 +112,11 @@ async function main() {
   //   ★ → 两个渠道的书架【合并】，划线各取各的（谁有就用谁的）★
   const API = require("./微信读书官方API");
   const hasKey = API.hasApiKey();
+  // ★★★ 请求节流（★ 2026-11-07 ★）★★★ ★
+  //   ★ 全量同步 = 107 本 × 3 次请求 ≈ 320 次 → 不节流必撞「频率超限 -2014」★
+  //   ★ 350ms 间隔 → 约 2 分钟跑完 107 本，安全不撞限流 ★
+  const MIN_GAP = Number(process.env.WEREAD_MIN_GAP || 350);
+  API.setMinGap(MIN_GAP);
   const shelfMap = {};          // bookId → 书籍概要
   const allIds = [];
   let apiShelfCount = 0;
@@ -163,11 +196,14 @@ async function main() {
   const withMarks = [];
   for (const id of targets) {
     // ★ 双通道：官方 API 优先，失败降级 Cookie ★
+    // ★★★ 2026-11-07：★ 这里的探测【只是排序用】★ ★
+    //   ★ → 拿不到就当「没读过」→ 排在后面 → 不影响数据正确性 ★
+    //   ★ → 但会多发 107 次请求 → 撞限流的风险 ★ → 限流就跳过 ★
     let pg = null;
     if (useApi) {
       try { pg = await API.getProgress(id); } catch (e) { pg = null; }
     }
-    if (!pg && cred.vid && cred.skey) {
+    if (!pg && cred.vid && cred.skey && !cookieAuthDead) {
       try { pg = await W.getProgress(id, cred); } catch (e) { /* 忽略 */ }
     }
     if (pg && (pg.readingTime > 0 || pg.overallProgress > 0)) withMarks.push(id);
@@ -206,7 +242,7 @@ async function main() {
         const one = await API.getBookInfo(bookId);
         if (one) meta = one;
       }
-      if (!meta.title && cred.vid && cred.skey) {
+      if (!meta.title && cred.vid && cred.skey && !cookieAuthDead) {
         const one = await W.getBookInfo(bookId, cred);
         if (one) meta = one;
       }
@@ -236,20 +272,28 @@ async function main() {
       } catch (e) { /* 降级到 Cookie */ }
     }
     // ★ Cookie 兜底（★ 官方拿不到时用浏览器登录的账号 ★）
-    if (!gotMarks && cred.vid && cred.skey) {
+    if (!gotMarks && cred.vid && cred.skey && !cookieAuthDead) {
       try {
         const r = await W.getMarksAndNotes(bookId, cred);
         bmList = r.marks; rvList = r.notes; gotMarks = true;
       } catch (e) {
-        // ★★★ 认证错误【必须中断】★★★ ★
-        //   ★ 吞掉 → 「划线 0 条」→ 同步到 Notion 的也是 0 → 看起来像【账号没划线】★
-        //   ★ 实际是登录态坏了 → 方向全错 ★
-        if (/登录态失效|账号 ID 无效|没有微信读书凭证|登录超时|用户不存在/.test(String(e.message || ""))) {
+        // ★★★ 认证错误的处理（★ 分两种情况 ★）★★★ ★
+        //   ★ 情况 A：官方 API 通道【也】失败 → 真认证问题 → 必须中断 ★
+        //     ★ 吞掉 → 「划线 0 条」→ 看起来像【账号没划线】→ 方向全错 ★
+        //   ★ 情况 B：官方 API 通道是好的（★ 只是这一本拉失败 ★）★
+        //     ★ → Cookie 失效【不】该中断 → 跳过这本继续 ★
+        const authErr = /登录态失效|账号 ID 无效|没有微信读书凭证|登录超时|用户不存在/.test(String(e.message || ""));
+        if (authErr && !useApi) {
           console.log("");
           console.log("  ✘ 微信读书认证失效 → 中止同步");
           console.log("    " + String(e.message).slice(0, 100));
           console.log("    → 请跑【双击登录微信读书.bat】重新扫码后再同步");
           throw e;
+        }
+        if (authErr) {
+          // ★ 官方 API 还在用 → 只跳过这本书 ★
+          cookieAuthDead = true;
+          console.log("    ⚠ Cookie 通道已失效（★ 但官方 API 正常 → 跳过这本 ★）");
         }
       }
     }
@@ -403,7 +447,7 @@ async function main() {
     if (useApi) {
       try { prog = await API.getProgress(bookId); } catch (e) { prog = null; }
     }
-    if (!prog && cred.vid && cred.skey) {
+    if (!prog && cred.vid && cred.skey && !cookieAuthDead) {
       try { prog = await W.getProgress(bookId, cred); } catch (e) { prog = null; }
     }
     const readState = Number(meta.readState || 0);
@@ -449,25 +493,104 @@ async function main() {
       continue;
     }
     if (!canWrite) { nSkip++; continue; }
+
+    // ════════════════════════════════════════════════════════════
+    //  ★★★ 2026-11-07：★ 三方合并 + 字段级跳过 ★★★
+    //   ★ 之前：无条件 PATCH 全部属性 + 每次重设封面
+    //   ★   → ① Notion 上 107 本书每次都被【重写】→ 看起来像「每次都重建」
+    //   ★   → ② 你在 Notion 上手改的属性（评分/状态/标签）被【覆盖】★
+    //   ★ 现在：三方对比 → 只写【真正变了】的字段 → 没变就完全不碰
+    // ════════════════════════════════════════════════════════════
+    const srcFlat = N.flatProps(bprops);
+    const nowFlat = (bookHit && bookHit.snap) || {};
+    const baseEntry = BASE.getEntry(baseline, String(bookId));
+    // ★ 要参与合并的字段（★ 关系型也参与 → 划线/笔记变化才回填 ★）
+    const MERGE_FIELDS = Object.keys(srcFlat);
+    // ★ 用户【可能手改】的字段 → 首次跑（无基线）时保守保留 Notion 现值 ★
+    const CAUTIOUS = ["标题", "简介", "阅读状态", "分类", "作者"];
+    const mg = BASE.merge3(baseEntry, nowFlat, srcFlat, MERGE_FIELDS, CAUTIOUS);
+
+    // ★★★ 只把【真正变了】的字段放进要写的 props ★★★
+    const writeProps = {};
+    for (const f of Object.keys(mg.changed)) {
+      const v = srcFlat[f];
+      if (v === "" || v === undefined) continue;
+      // ★ 把扁平值还原成 Notion 属性格式 ★
+      const orig = bprops[f];
+      if (!orig) continue;
+      writeProps[f] = orig;
+    }
+
+    // ★★ 封面：★ 只有封面 URL 变了才设（★ 每次都设 → 每次都刷编辑时间 ★）★★
+    const coverChanged = !BASE.eq(
+      (nowFlat["封面"] || ""),
+      coverUrl || ""
+    );
+
     try {
-      // ★ 封面：默认占位图也设上（★ 至少不是灰色图标 ★）
       if (bookHit) {
-        await N.api("/pages/" + bookHit.id, "PATCH", { properties: bprops }, token);
-        if (coverUrl) await N.setCover(bookHit.id, coverUrl, token);
+        // ★★★ 没有任何字段变化 → 完全跳过 PATCH（★ 不刷新编辑时间 ★）★★★
+        const nFields = Object.keys(writeProps).length;
+        if (!nFields && !coverChanged) {
+          nSkip++;
+          // ★ 基线照旧记（★ 记录这次看到的 Notion 值 ★）
+          BASE.setEntry(baseline, String(bookId), nowFlat, srcFlat);
+          continue;
+        }
+        if (nFields) {
+          await N.api("/pages/" + bookHit.id, "PATCH", { properties: writeProps }, token);
+        }
+        if (coverChanged && coverUrl) {
+          await N.setCover(bookHit.id, coverUrl, token);
+        }
+        // ★ 保留用户修改的字段 → 记进基线（★ 下次还认得出是你改的 ★）
+        const mergedSnap = Object.assign({}, nowFlat);
+        for (const f of Object.keys(mg.use)) {
+          if (mg.kept.indexOf(f) >= 0) mergedSnap[f] = mg.use[f];
+        }
+        for (const f of Object.keys(writeProps)) {
+          mergedSnap[f] = srcFlat[f];
+        }
+        BASE.setEntry(baseline, String(bookId), mergedSnap, srcFlat);
+        console.log("    ✔ " + title + "（更新 " + nFields + " 项" +
+          (coverChanged && coverUrl ? " + 封面" : "") +
+          (mg.kept.length ? "｜保留你的修改 " + mg.kept.join("、") : "") +
+          (mg.conflict.length ? "｜冲突 " + mg.conflict.join("、") : "") +
+          "）");
       } else {
+        // ★ 新建：全量写入 + 记录基线 ★
         const p = await N.api("/pages", "POST", {
           parent: { type: "data_source_id", data_source_id: N.DS_BOOK },
           properties: bprops,
           ...(coverUrl ? { cover: { type: "external", external: { url: String(coverUrl) } } } : {}),
         }, token);
+        books.byKey.set(String(bookId), { id: p.id, url: p.url, title, snap: srcFlat });
+        BASE.setEntry(baseline, String(bookId), srcFlat, srcFlat);
+        console.log("    ✔ " + title + "（新建｜划线 " + markIds.length + " ｜ 笔记 " + noteIds.length + "）");
       }
-      console.log("    ✔ " + title + "（划线 " + markIds.length + " ｜ 笔记 " + noteIds.length + "）");
       nBook++;
     } catch (e) {
       console.log("    ✘ 书籍 " + title + " → " + String(e.message).slice(0, 120));
       nSkip++;
     }
     if (bi % 5 === 4) await sleep(500);
+  }
+
+  // ════════════════════════════════════════════════════════════
+  //  ★★★ 保存基线（★ 云端存 Notion，本地存文件 ★）★★★
+  // ════════════════════════════════════════════════════════════
+  if (!DRY) {
+    try {
+      if (process.env.WEREAD_BASELINE_TO_NOTION) {
+        await BASE.saveBaselineToNotion(baseline, N.api, N.DS_TAG, token);
+        console.log("  ✔ 基线已存进 Notion（" + Object.keys(baseline).length + " 条）");
+      } else {
+        BASE.saveBaseline(baseline);
+        console.log("  ✔ 基线已保存 → " + BASE.BASELINE_FILE + "（" + Object.keys(baseline).length + " 条）");
+      }
+    } catch (e) {
+      console.log("  ⚠ 基线保存失败：" + String(e.message).slice(0, 100));
+    }
   }
 
   console.log("");
