@@ -127,7 +127,21 @@ async function gw(apiName, params, opt) {
       await sleep(Math.min(2000 * Math.pow(2, attempt - 1), 30000));
       continue;
     }
-    if (!r.ok) throw new Error("微信读书 API HTTP " + r.status + " → " + t.slice(0, 200));
+    if (!r.ok) {
+      // ★★★ 403 = ★ Key 被拒绝（★ 风控封禁 / Key 失效 / 权限被撤 ★）★★★ ★
+      //   ★ 微信的 WAF 会返回 403 + 空 body + X-W-No 头 ★
+      //   ★ → 给一句【能看懂、能行动】的提示（★ 而不是干巴巴的 403 ★）
+      if (r.status === 403) {
+        throw new Error(
+          "微信读书 API 拒绝了这个 Key（HTTP 403）\n" +
+          "  ★ 原因：★ 刚跑过太多次全量同步 → ★ Key 被临时风控 ★（★ 或者 Key 已失效 ★）\n" +
+          "  ★ 等 10-30 分钟通常自动恢复 ★\n" +
+          "  ★ 若一直不行：★ 微信读书 App → 设置 → 开发者 → 重新生成 API Key ★\n" +
+          "     → 写进「系统附件/同步/微信读书APIKey.txt」→ 跑「发布脚本到云端」"
+        );
+      }
+      throw new Error("微信读书 API HTTP " + r.status + " → " + t.slice(0, 200));
+    }
 
     const code = code0;
     if (code !== 0) {
