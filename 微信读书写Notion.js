@@ -80,6 +80,62 @@ async function api(pathname, method, body, token) {
 // ══════════════════════════════════════════════════
 //  通用：一个库的行管理器
 // ══════════════════════════════════════════════════
+/**
+ * ★★★ 把 Notion 属性转成【可比对的扁平值】★★★ ★
+ *   ★ 用于三方合并：★ 判断「Notion 现在的值」和「上次同步时的值」是否不同 ★
+ *   ★ → 不用 hash（★ hash 碰撞风险 + 不好调试 ★）→ 直接存可读值 ★
+ */
+function snapshotProps(pr) {
+  const out = {};
+  for (const k of Object.keys(pr || {})) {
+    const v = pr[k];
+    if (!v) continue;
+    const t = v.type;
+    if (t === "title") {
+      out[k] = (v.title || []).map((x) => x.plain_text).join("");
+    } else if (t === "rich_text") {
+      out[k] = (v.rich_text || []).map((x) => x.plain_text).join("");
+    } else if (t === "number") {
+      out[k] = v.number === null || v.number === undefined ? "" : String(v.number);
+    } else if (t === "url") {
+      out[k] = v.url || "";
+    } else if (t === "status") {
+      out[k] = (v.status && v.status.name) || "";
+    } else if (t === "select") {
+      out[k] = (v.select && v.select.name) || "";
+    } else if (t === "date") {
+      out[k] = (v.date && v.date.start) || "";
+    } else if (t === "relation") {
+      // ★ relation 用「排序后的 id 列表」→ 顺序不同不算变化 ★
+      out[k] = (v.relation || []).map((x) => x.id).sort().join(",");
+    } else if (t === "checkbox") {
+      out[k] = v.checkbox ? "1" : "";
+    }
+  }
+  return out;
+}
+
+/**
+ * ★★★ 把【要写入的属性】转成同样的扁平值（★ 和 snapshotProps 对齐 ★）★★★
+ */
+function flatProps(props) {
+  const out = {};
+  for (const k of Object.keys(props || {})) {
+    const v = props[k];
+    if (!v) continue;
+    if (v.title) out[k] = (v.title || []).map((x) => (x.text && x.text.content) || x.plain_text || "").join("");
+    else if (v.rich_text) out[k] = (v.rich_text || []).map((x) => (x.text && x.text.content) || x.plain_text || "").join("");
+    else if (v.number !== undefined) out[k] = v.number === null ? "" : String(v.number);
+    else if (v.url !== undefined) out[k] = v.url || "";
+    else if (v.status) out[k] = (v.status && v.status.name) || "";
+    else if (v.select) out[k] = (v.select && v.select.name) || "";
+    else if (v.date) out[k] = (v.date && v.date.start) || "";
+    else if (v.relation) out[k] = (v.relation || []).map((x) => x.id).sort().join(",");
+    else if (v.checkbox !== undefined) out[k] = v.checkbox ? "1" : "";
+  }
+  return out;
+}
+
 class Store {
   /**
    * @param {String} dsId   数据源 id
@@ -108,6 +164,9 @@ class Store {
         const key = this._txt(pr[this.keyProp]);
         const title = this._txt(pr[this.titleProp]);
         const rec = { id: p.id, url: p.url, title };
+        // ★★★ 2026-11-07：★ 记录 Notion 现值快照（★ 三方合并要用 ★）★★★ ★
+        //   ★ 没有它 → 无法判断「是你改的」还是「同步改的」→ 只能全量覆盖 ★
+        rec.snap = snapshotProps(pr);
         if (key) this.byKey.set(key, rec);
         if (title) this.byTitle.set(title, rec);
       }
@@ -272,4 +331,5 @@ module.exports = {
   loadToken, api, Store, sleep, setCover,
   DS_BOOK, DS_MARK, DS_NOTE, DS_TAG, DS_AUTHOR, DS_CAT, DS_YEAR, DS_MONTH, DS_WEEK,
   ts2iso, ymd2iso, timeKeys, markBlocks, noteBlocks, clearChildren, appendBlocks,
+  snapshotProps, flatProps,
 };
